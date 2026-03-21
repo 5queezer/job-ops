@@ -1,8 +1,8 @@
 /**
  * MCP server using StreamableHTTPServerTransport.
  *
- * Exposes an Express router that handles POST /mcp requests,
- * validating Bearer tokens from the OAuth provider.
+ * Creates a new McpServer instance per session to avoid transport conflicts.
+ * Validates Bearer tokens from the OAuth provider.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -12,15 +12,22 @@ import { Router } from "express";
 import { validateBearerToken } from "./oauth";
 import { registerTools } from "./tools";
 
-const mcpServer = new McpServer({
-  name: "job-ops",
-  version: "0.2.0",
-});
+interface SessionEntry {
+  transport: StreamableHTTPServerTransport;
+  server: McpServer;
+}
 
-registerTools(mcpServer);
+// Map of session ID -> { transport, server }
+const sessions = new Map<string, SessionEntry>();
 
-// Map of session ID -> transport for stateful sessions
-const transports = new Map<string, StreamableHTTPServerTransport>();
+function createSessionServer(): McpServer {
+  const server = new McpServer({
+    name: "job-ops",
+    version: "0.2.0",
+  });
+  registerTools(server);
+  return server;
+}
 
 export function createMcpRouter(): Router {
   const router = Router();
@@ -31,34 +38,35 @@ export function createMcpRouter(): Router {
       return;
     }
 
-    // Check for existing session
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    let transport: StreamableHTTPServerTransport;
 
-    const existing = sessionId ? transports.get(sessionId) : undefined;
+    const existing = sessionId ? sessions.get(sessionId) : undefined;
     if (sessionId && existing) {
-      transport = existing;
-    } else if (!sessionId) {
-      // New session - create transport
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => crypto.randomUUID(),
-      });
+      await existing.transport.handleRequest(req, res, req.body);
+      return;
+    }
 
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          transports.delete(transport.sessionId);
-        }
-      };
-
-      await mcpServer.connect(transport);
-
-      if (transport.sessionId) {
-        transports.set(transport.sessionId, transport);
-      }
-    } else {
-      // Invalid session ID
+    if (sessionId && !existing) {
       res.status(404).json({ error: "Session not found" });
       return;
+    }
+
+    // New session
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+    });
+    const server = createSessionServer();
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+      }
+    };
+
+    await server.connect(transport);
+
+    if (transport.sessionId) {
+      sessions.set(transport.sessionId, { transport, server });
     }
 
     await transport.handleRequest(req, res, req.body);
@@ -72,17 +80,12 @@ export function createMcpRouter(): Router {
     }
 
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports.has(sessionId)) {
+    const entry = sessionId ? sessions.get(sessionId) : undefined;
+    if (!entry) {
       res.status(404).json({ error: "Session not found" });
       return;
     }
-
-    const transport = transports.get(sessionId);
-    if (!transport) {
-      res.status(404).json({ error: "Session not found" });
-      return;
-    }
-    await transport.handleRequest(req, res);
+    await entry.transport.handleRequest(req, res);
   });
 
   // Handle DELETE for session termination
@@ -93,18 +96,13 @@ export function createMcpRouter(): Router {
     }
 
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports.has(sessionId)) {
+    const entry = sessionId ? sessions.get(sessionId) : undefined;
+    if (!entry) {
       res.status(404).json({ error: "Session not found" });
       return;
     }
-
-    const transport = transports.get(sessionId);
-    if (!transport) {
-      res.status(404).json({ error: "Session not found" });
-      return;
-    }
-    await transport.close();
-    transports.delete(sessionId);
+    await entry.transport.close();
+    if (sessionId) sessions.delete(sessionId);
     res.status(200).end();
   });
 

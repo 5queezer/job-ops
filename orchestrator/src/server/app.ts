@@ -277,8 +277,7 @@ export function createApp() {
     next();
   });
 
-  // MCP OAuth routes (before auth guard - they handle their own auth)
-  app.use(express.urlencoded({ extended: false }));
+  // MCP OAuth + server routes (before auth guard - they handle their own auth)
   app.use(createOAuthRouter());
   app.use(createMcpRouter());
 

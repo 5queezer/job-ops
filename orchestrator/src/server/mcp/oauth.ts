@@ -12,14 +12,17 @@
 
 import crypto from "node:crypto";
 import type { Request, Response } from "express";
-import { Router } from "express";
+import express, { Router } from "express";
 
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const PENDING_REQUEST_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const CLIENT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_FAILED_ATTEMPTS = 5;
 const GLOBAL_MAX_FAILED_ATTEMPTS = 20;
 const GLOBAL_RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const GLOBAL_LOCKOUT_MS = 60 * 1000; // 60 seconds
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Frame-Options": "DENY",
@@ -54,6 +57,7 @@ interface AccessToken {
   clientId: string;
   scopes: string[];
   createdAt: number;
+  expiresAt: number;
 }
 
 interface PendingAuthRequest {
@@ -130,6 +134,34 @@ function cleanupExpiredAuthCodes(): void {
     }
   }
 }
+
+function cleanupExpiredTokens(): void {
+  const now = Date.now();
+  for (const [key, token] of accessTokens) {
+    if (now > token.expiresAt) {
+      accessTokens.delete(key);
+    }
+  }
+}
+
+function cleanupExpiredClients(): void {
+  const now = Date.now();
+  for (const [key, client] of clients) {
+    if (now - client.registeredAt > CLIENT_TTL_MS) {
+      clients.delete(key);
+    }
+  }
+}
+
+function runCleanup(): void {
+  cleanupExpiredRequests();
+  cleanupExpiredAuthCodes();
+  cleanupExpiredTokens();
+  cleanupExpiredClients();
+}
+
+// Periodic cleanup to prevent memory leaks
+setInterval(runCleanup, CLEANUP_INTERVAL_MS).unref();
 
 function getBaseUrl(req: Request): string {
   if (process.env.PUBLIC_URL) {
@@ -282,6 +314,14 @@ export function createOAuthRouter(): Router {
       return;
     }
 
+    // PKCE is mandatory per OAuth 2.1
+    if (!code_challenge) {
+      res.status(400).json({
+        error: "code_challenge is required (OAuth 2.1 mandates PKCE)",
+      });
+      return;
+    }
+
     if (code_challenge_method && code_challenge_method !== "S256") {
       res
         .status(400)
@@ -294,7 +334,7 @@ export function createOAuthRouter(): Router {
       clientId: client_id,
       redirectUri: redirect_uri,
       state: state || "",
-      codeChallenge: code_challenge || "",
+      codeChallenge: code_challenge,
       codeChallengeMethod: code_challenge_method || "S256",
       scopes: scope ? scope.split(" ") : [],
       createdAt: Date.now(),
@@ -328,122 +368,126 @@ export function createOAuthRouter(): Router {
     htmlResponse(res, loginHtml(requestId));
   });
 
-  // Login page - POST
-  router.post("/oauth/login", (req: Request, res: Response) => {
-    const requestId = String(req.body?.request_id ?? "");
-    const password = String(req.body?.password ?? "");
+  // Login page - POST (urlencoded body parser scoped to this route only)
+  router.post(
+    "/oauth/login",
+    express.urlencoded({ extended: false }),
+    (req: Request, res: Response) => {
+      const requestId = String(req.body?.request_id ?? "");
+      const password = String(req.body?.password ?? "");
 
-    const pending = pendingRequests.get(requestId);
-    if (!pending) {
-      htmlResponse(res, "Invalid or expired login request.", 400);
-      return;
-    }
-
-    if (Date.now() - pending.createdAt > PENDING_REQUEST_TTL_MS) {
-      pendingRequests.delete(requestId);
-      htmlResponse(
-        res,
-        "Login request expired. Please restart the authorization flow.",
-        400,
-      );
-      return;
-    }
-
-    // Global rate limit
-    const now = Date.now();
-    if (now < globalLockoutUntil) {
-      htmlResponse(
-        res,
-        "Too many failed login attempts. Please try again later.",
-        429,
-      );
-      return;
-    }
-
-    let expectedPassword: string;
-    try {
-      expectedPassword = getPassword();
-    } catch {
-      htmlResponse(res, "Server misconfigured. Contact administrator.", 500);
-      return;
-    }
-
-    if (!constantTimeCompare(password, expectedPassword)) {
-      pending.failedAttempts += 1;
-      if (pending.failedAttempts >= MAX_FAILED_ATTEMPTS) {
-        pendingRequests.delete(requestId);
+      const pending = pendingRequests.get(requestId);
+      if (!pending) {
+        htmlResponse(res, "Invalid or expired login request.", 400);
+        return;
       }
 
-      // Track global failures
-      const cutoff = now - GLOBAL_RATE_LIMIT_WINDOW_MS;
-      const recentFailures = globalFailedAttempts.filter((t) => t > cutoff);
-      recentFailures.push(now);
-      globalFailedAttempts.length = 0;
-      globalFailedAttempts.push(...recentFailures);
-
-      if (globalFailedAttempts.length >= GLOBAL_MAX_FAILED_ATTEMPTS) {
-        globalLockoutUntil = now + GLOBAL_LOCKOUT_MS;
+      if (Date.now() - pending.createdAt > PENDING_REQUEST_TTL_MS) {
+        pendingRequests.delete(requestId);
         htmlResponse(
           res,
-          "Too many failed login attempts. Please try again later, then restart the authorization flow from your client.",
+          "Login request expired. Please restart the authorization flow.",
+          400,
+        );
+        return;
+      }
+
+      // Global rate limit
+      const now = Date.now();
+      if (now < globalLockoutUntil) {
+        htmlResponse(
+          res,
+          "Too many failed login attempts. Please try again later.",
           429,
         );
         return;
       }
 
-      if (pending.failedAttempts >= MAX_FAILED_ATTEMPTS) {
+      let expectedPassword: string;
+      try {
+        expectedPassword = getPassword();
+      } catch {
+        htmlResponse(res, "Server misconfigured. Contact administrator.", 500);
+        return;
+      }
+
+      if (!constantTimeCompare(password, expectedPassword)) {
+        pending.failedAttempts += 1;
+        if (pending.failedAttempts >= MAX_FAILED_ATTEMPTS) {
+          pendingRequests.delete(requestId);
+        }
+
+        // Track global failures
+        const cutoff = now - GLOBAL_RATE_LIMIT_WINDOW_MS;
+        const recentFailures = globalFailedAttempts.filter((t) => t > cutoff);
+        recentFailures.push(now);
+        globalFailedAttempts.length = 0;
+        globalFailedAttempts.push(...recentFailures);
+
+        if (globalFailedAttempts.length >= GLOBAL_MAX_FAILED_ATTEMPTS) {
+          globalLockoutUntil = now + GLOBAL_LOCKOUT_MS;
+          htmlResponse(
+            res,
+            "Too many failed login attempts. Please try again later, then restart the authorization flow from your client.",
+            429,
+          );
+          return;
+        }
+
+        if (pending.failedAttempts >= MAX_FAILED_ATTEMPTS) {
+          htmlResponse(
+            res,
+            "Too many failed attempts. Please restart the authorization flow.",
+            403,
+          );
+          return;
+        }
+
+        const remaining = MAX_FAILED_ATTEMPTS - pending.failedAttempts;
         htmlResponse(
           res,
-          "Too many failed attempts. Please restart the authorization flow.",
-          403,
+          loginHtml(
+            requestId,
+            `Invalid password. ${remaining} attempt(s) remaining.`,
+          ),
         );
         return;
       }
 
-      const remaining = MAX_FAILED_ATTEMPTS - pending.failedAttempts;
-      htmlResponse(
-        res,
-        loginHtml(
-          requestId,
-          `Invalid password. ${remaining} attempt(s) remaining.`,
-        ),
-      );
-      return;
-    }
+      // Password correct - create auth code and redirect
+      pendingRequests.delete(requestId);
+      cleanupExpiredAuthCodes();
 
-    // Password correct - create auth code and redirect
-    pendingRequests.delete(requestId);
-    cleanupExpiredAuthCodes();
+      const client = clients.get(pending.clientId);
+      if (!client) {
+        htmlResponse(
+          res,
+          "Client registration not found. Please restart the authorization flow from your client.",
+          400,
+        );
+        return;
+      }
 
-    const client = clients.get(pending.clientId);
-    if (!client) {
-      htmlResponse(
-        res,
-        "Client registration not found. Please restart the authorization flow from your client.",
-        400,
-      );
-      return;
-    }
+      const codeValue = `auth_code_${crypto.randomBytes(16).toString("hex")}`;
+      const authCode: AuthCode = {
+        code: codeValue,
+        clientId: pending.clientId,
+        redirectUri: pending.redirectUri,
+        scopes: pending.scopes,
+        codeChallenge: pending.codeChallenge,
+        expiresAt: Date.now() + AUTH_CODE_TTL_MS,
+      };
+      authCodes.set(codeValue, authCode);
 
-    const codeValue = `auth_code_${crypto.randomBytes(16).toString("hex")}`;
-    const authCode: AuthCode = {
-      code: codeValue,
-      clientId: pending.clientId,
-      redirectUri: pending.redirectUri,
-      scopes: pending.scopes,
-      codeChallenge: pending.codeChallenge,
-      expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-    };
-    authCodes.set(codeValue, authCode);
+      const redirectUrl = new URL(pending.redirectUri);
+      redirectUrl.searchParams.set("code", codeValue);
+      if (pending.state) {
+        redirectUrl.searchParams.set("state", pending.state);
+      }
 
-    const redirectUrl = new URL(pending.redirectUri);
-    redirectUrl.searchParams.set("code", codeValue);
-    if (pending.state) {
-      redirectUrl.searchParams.set("state", pending.state);
-    }
-
-    res.redirect(302, redirectUrl.toString());
-  });
+      res.redirect(302, redirectUrl.toString());
+    },
+  );
 
   // Token endpoint
   router.post("/oauth/token", (req: Request, res: Response) => {
@@ -461,7 +505,7 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    if (!code || !client_id) {
+    if (!code || !client_id || !client_secret) {
       res.status(400).json({ error: "invalid_request" });
       return;
     }
@@ -472,10 +516,7 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    if (
-      client_secret &&
-      !constantTimeCompare(client_secret, client.clientSecret)
-    ) {
+    if (!constantTimeCompare(client_secret, client.clientSecret)) {
       res.status(400).json({ error: "invalid_client" });
       return;
     }
@@ -502,33 +543,37 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    // Verify PKCE
-    if (authCode.codeChallenge) {
-      if (!code_verifier) {
-        res.status(400).json({ error: "invalid_grant" });
-        return;
-      }
-      if (!verifyCodeChallenge(code_verifier, authCode.codeChallenge)) {
-        res.status(400).json({ error: "invalid_grant" });
-        return;
-      }
+    // Verify PKCE (mandatory)
+    if (!code_verifier) {
+      res.status(400).json({
+        error: "invalid_grant",
+        error_description: "code_verifier is required",
+      });
+      return;
+    }
+    if (!verifyCodeChallenge(code_verifier, authCode.codeChallenge)) {
+      res.status(400).json({ error: "invalid_grant" });
+      return;
     }
 
-    // Consume the auth code
+    // Consume the auth code (single-use)
     authCodes.delete(code);
 
+    const now = Date.now();
     const tokenValue = crypto.randomBytes(32).toString("hex");
     const token: AccessToken = {
       token: tokenValue,
       clientId: client_id,
       scopes: authCode.scopes,
-      createdAt: Date.now(),
+      createdAt: now,
+      expiresAt: now + ACCESS_TOKEN_TTL_MS,
     };
     accessTokens.set(tokenValue, token);
 
     res.json({
       access_token: tokenValue,
       token_type: "Bearer",
+      expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
       scope: authCode.scopes.join(" "),
     });
   });
@@ -538,10 +583,16 @@ export function createOAuthRouter(): Router {
 
 /**
  * Validate a Bearer token from the Authorization header.
- * Returns the token string if valid, or null if invalid.
+ * Returns true if the token is valid and not expired.
  */
 export function validateBearerToken(authHeader: string | undefined): boolean {
   if (!authHeader?.startsWith("Bearer ")) return false;
-  const token = authHeader.slice("Bearer ".length).trim();
-  return accessTokens.has(token);
+  const tokenValue = authHeader.slice("Bearer ".length).trim();
+  const token = accessTokens.get(tokenValue);
+  if (!token) return false;
+  if (Date.now() > token.expiresAt) {
+    accessTokens.delete(tokenValue);
+    return false;
+  }
+  return true;
 }
