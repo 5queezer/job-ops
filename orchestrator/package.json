@@ -12,7 +12,7 @@
     "ci": "biome ci",
     "check": "biome check",
     "check:fix": "biome check --write",
-    "check:types": "node --max-old-space-size=4096 ./node_modules/.bin/tsc --noEmit",
+    "check:types": "NODE_OPTIONS=--max-old-space-size=4096 tsc --noEmit",
     "format": "biome format",
     "format:fix": "biome format --write",
     "build:client": "vite build",
