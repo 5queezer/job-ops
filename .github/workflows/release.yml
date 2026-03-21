@@ -140,6 +140,8 @@ jobs:
   deploy:
     needs: [release]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
     steps:
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -151,6 +153,6 @@ jobs:
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: job-ops
-          image: ghcr.io/5queezer/job-ops:v${{ inputs.version }}
+          image: ghcr.io/${{ github.repository_owner }}/job-ops:v${{ inputs.version }}
           region: europe-west1
           project_id: job-tracker-vasudev
