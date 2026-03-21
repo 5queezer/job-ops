@@ -24,6 +24,8 @@ import express from "express";
 import { apiRouter } from "./api/index";
 import { getDataDir } from "./config/dataDir";
 import { isDemoMode } from "./config/demo";
+import { createOAuthRouter } from "./mcp/oauth";
+import { createMcpRouter } from "./mcp/server";
 import { resolveTracerRedirect } from "./services/tracer-links";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -274,6 +276,11 @@ export function createApp() {
     });
     next();
   });
+
+  // MCP OAuth routes (before auth guard - they handle their own auth)
+  app.use(express.urlencoded({ extended: false }));
+  app.use(createOAuthRouter());
+  app.use(createMcpRouter());
 
   // Optional Basic Auth for write access (read-only by default)
   app.use(authGuard.middleware);
