@@ -15,6 +15,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 concurrency:
   group: release-${{ inputs.version }}
@@ -135,3 +136,23 @@ jobs:
           fi
 
           gh release create "v$RELEASE_VERSION" --title "$RELEASE_TITLE" --generate-notes
+
+  deploy:
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/927033598321/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-deploy@job-tracker-vasudev.iam.gserviceaccount.com
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: job-ops
+          image: ghcr.io/${{ github.repository_owner }}/job-ops:v${{ inputs.version }}
+          region: europe-west1
+          project_id: job-tracker-vasudev
